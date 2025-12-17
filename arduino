@@ -1,0 +1,61 @@
+// Reads quadrature encoder signals from a DRO and sends position over Serial
+// Revision: 1.0
+// Author: Jere Leman
+// Date: 2025-11-23
+
+
+// Define pins RX and TX for Arduino Uno (A and B Phase)
+const int pinA = 2, pinB = 3;
+
+// Quadrature lookup table
+const int phaseLookup[] = {0,-1,1,-1,1,0,-1,-1,-1,1,0,1,1,1,-1,0};
+
+// Volatile variables (Volatile because they are used in ISR)
+volatile bool A = false, B = false;
+volatile int phase = 0;
+volatile long counter = 0;
+volatile bool updated = false;
+
+// Setup function
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(pinA, INPUT);
+  pinMode(pinB, INPUT);
+
+  attachInterrupt(digitalPinToInterrupt(pinA), trig, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(pinB), trig, CHANGE);
+}
+
+// Main loop
+void loop() {
+  // Handle incoming commands
+  if (Serial.available()) {
+    String cmd = Serial.readStringUntil('\n');
+    cmd.trim();
+
+    if (cmd.equalsIgnoreCase("ZERO")) {
+      counter = 0;
+      Serial.println("OK ZERO");
+    }
+    else if (cmd.equalsIgnoreCase("READ")) {
+      // send counts as float mm or raw counts
+      Serial.print("POS ");
+      Serial.println(counter);  // if you want mm: counter/resolution
+    }
+  }
+}
+
+// Quadrature ISR
+void trig() {
+  A = digitalRead(pinA);
+  B = digitalRead(pinB);
+
+  phase <<= 1;
+  phase |= A;
+  phase <<= 1;
+  phase |= B;
+  phase &= 0xF;
+
+  counter += phaseLookup[phase];
+}

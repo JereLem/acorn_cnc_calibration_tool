@@ -1,190 +1,352 @@
-import os
+# CNC Ballscrew Auto Calibration Tool
+# Uses an Arduino to read DRO values while sending incremental move commands to Acorn CNC software.
+# Author: Jere Leman
+# Date: 2025-06-10
+# Revision: 1.0
+# Requirements: pyserial, pyautogui, tkinter
+
+
+# Imports
+import serial
+import time
+import pyautogui
+import re
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, simpledialog, messagebox
 
-# Initialize tkinter
-root = tk.Tk()
-root.title("CNC Tab File Calibration")
-root.geometry("800x500")
+# Configurable parameters
+ARDUINO_COM = None  # If None, script will ask for COM (e.g., COM5)
+BAUDRATE = 115200   # Arduino serial baudrate
+SETTLE_TIME = 3.0   # Seconds dwell time after move
+CMD_DELAY = 0.15    # Seconds delay between commands
+READ_TIMEOUT = 2.0  # Seconds read timeout
 
-# Global variables to hold file data
-data = []
-input_file = None
-output_file = None
-cumulative_error_mode = tk.BooleanVar()  # Variable to track the state of cumulative error mode
+pyautogui.FAILSAFE = True
 
-# Function to load the .tab file
-def load_file():
-    global data, input_file
 
-    # Ask user to select a file
-    input_file = filedialog.askopenfilename(
-        title="Select a TAB File",
-        filetypes=(("TAB files", "*.tab"), ("All files", "*.*"))
+def choose_tab_file():
+    """
+    Open file dialog to choose .TAB file.
+    
+    """
+    root = tk.Tk()
+    root.withdraw()
+    return filedialog.askopenfilename(
+        title="Select CNC .tab file",
+        filetypes=[("TAB files", "*.tab"), ("All files", "*.*")]
     )
 
-    if not input_file:
-        return
 
-    # Read file content
-    with open(input_file, mode='r') as file:
-        lines = file.readlines()
-
-    # Skip headers and store data (from line 6 onwards)
-    data = lines[5:]
+def parse_tab_header(path):
+    """
+    Parse the .TAB file header and return parameters + full line list.
     
-    # Update label to show file loaded
-    file_label.config(text=f"Loaded: {os.path.basename(input_file)}")
-
-    # Enable navigation
-    next_button.config(state=tk.NORMAL)
-    save_button.config(state=tk.NORMAL)
+    Params:
+        path (str): path to .TAB file
     
-    # Display first row
-    display_row(0)
+    Returns:
+        entries (int): number of entries
+        num_points (int): number of points
+        step (float): step size
+        unitscode (int): units code (21=mm, 20=inch)
+        lines (list): full lines of the file
 
-# Variables to hold row index
-current_row = 0
+    """
+    with open(path, 'r') as f:
+        lines = [ln.rstrip('\n') for ln in f]
 
-# Function to display row
-def display_row(row_index):
-    global current_row
+    unitscode = 21
+    step = None
+    entries = None
+    axis = None
 
-    if row_index >= 0 and row_index < len(data):
-        current_row = row_index
-        row = data[row_index].split()
+    for ln in lines:
+        s = ln.strip()
+        if s.upper().startswith('UNITS'):
+            if 'MM' in s.upper():
+                unitscode = 21
+            elif 'INCH' in s.upper():
+                unitscode = 20
+        elif s.upper().startswith('INTERVAL'):
+            try:
+                step = float(s.split()[-1])
+            except ValueError:
+                pass
+        elif s.upper().startswith('ENTRIES'):
+            try:
+                entries = int(s.split()[-1])
+            except ValueError:
+                pass
+        elif s.upper().startswith('AXIS'):
+            axis = s.split()[-1].upper()
 
-        index_val.set(row[0])
-        measured_val.set(row[1])
-        correction_val.set(row[2])
-        row_label.config(text=f"Row {current_row+1}/{len(data)}")
+        if s.startswith('+') or s.startswith('-'):
+            break
 
-        # Enable/disable navigation buttons based on row index
-        prev_button.config(state=tk.NORMAL if row_index > 0 else tk.DISABLED)
-        next_button.config(state=tk.NORMAL if row_index < len(data) - 1 else tk.DISABLED)
+    if step is None or entries is None:
+        raise RuntimeError("Missing INTERVAL or ENTRIES in file header")
 
-# Function to update the current row with a new measured position
-def update_row(event=None):
-    global data, current_row
+    num_points = entries
+    print(f"Detected axis={axis}, step={step}, entries={entries}, unitscode={unitscode}")
+    return entries, num_points, step, unitscode, lines
 
-    # Get the new measured position from the user
-    new_measured = new_measured_entry.get()
 
-    # Validate input
-    try:
-        if input_file != None:
-            new_measured_float = float(new_measured)
+def open_serial(com):
+    """
+    Open serial connection to Arduino.
+    
+    Params:
+        com (str): COM port (e.g., 'COM5')
+    
+    Returns:
+        serial.Serial object
+    """
+    ser = serial.Serial(com, BAUDRATE, timeout=READ_TIMEOUT)
+    time.sleep(1.0)
+    ser.reset_input_buffer()
+    return ser
+
+
+def arduino_cmd(ser, cmd):
+    """
+    Send command to Arduino over serial.
+    
+    Params:
+        ser: serial.Serial object
+        cmd (str): command string   
+    """
+    ser.write((cmd + '\n').encode())
+    ser.flush()
+
+
+def arduino_read_pos(ser):
+    """
+    Read position from Arduino.
+    
+    Params:
+        ser: serial.Serial object
+    """
+    arduino_cmd(ser, "READ")
+    line = ser.readline().decode(errors='ignore').strip()
+    if line.upper().startswith('POS'):
+        try:
+            return float(line.split()[1])
+        except Exception:
+            return None
+    return None
+
+
+def run_pass(ser, n_steps, step_size, direction_sign=1):
+    """
+    Perform incremental moves one by one, reading DRO each time.
+
+    Params:
+        ser: serial.Serial object
+        n_steps (int): number of steps to perform
+        step_size (float): step size in mm
+    
+    Returns:
+        list: DRO readings after each step
+    
+    """
+    readings = []
+
+    # Enter MDI once before loop
+    pyautogui.press('f3')
+    time.sleep(CMD_DELAY)
+
+    for i in range(n_steps):
+        move = step_size if direction_sign > 0 else -step_size
+        cmd = f"G91 X{move}"
+
+        # Send incremental move
+        pyautogui.typewrite(cmd, interval=0.02)
+        pyautogui.press('enter')
+
+        # Wait for physical movement + settling
+        time.sleep(SETTLE_TIME)
+
+        # Read DRO from Arduino
+        dro = arduino_read_pos(ser)
+        if dro is None:
+            print(f"[WARN] step {i+1}: no DRO value, storing NaN")
+            dro = float('nan')
+
+        readings.append(dro)
+        print(f"Step {i+1}/{n_steps}: DRO={dro:.4f}")
+
+    # OPTIONAL: exit MDI mode
+    pyautogui.press('esc')
+    time.sleep(CMD_DELAY)
+
+    return readings
+
+
+
+def format_like(orig_str, value):
+    """
+    Preserve decimal places and plus sign style.
+
+    Params:
+        orig_str (str): original string to mimic
+        value (float): value to format
+    
+    Returns:
+        str: formatted string
+    
+    """
+    s = orig_str.strip()
+    plus = s.startswith('+')
+    s_nosign = s.lstrip('+-')
+    if '.' in s_nosign:
+        nd = len(s_nosign.split('.', 1)[1])
+        fmt = f"{{:.{nd}f}}"
+    else:
+        fmt = "{:.0f}"
+    out = fmt.format(value)
+    if plus and not out.startswith('-'):
+        out = '+' + out
+    return out
+
+
+def write_tab_file(original_lines, forward_errors, reverse_errors, step_size, save_path):
+    """
+    Write updated .TAB file with new calibration errors.
+    
+    Params:
+        original_lines (list): original .TAB file lines
+        forward_errors (list): forward pass errors
+        reverse_errors (list): reverse pass errors
+        step_size (float): step size in mm
+        save_path (str): path to save updated .TAB file
+
+    """
+    lines = original_lines[:]
+    pattern = re.compile(r'^(\s*)([+-]?\S+?)(\s+)([+-]?\S+?)(\s+)([+-]?\S+?)(.*)$')
+
+    data_start = None
+    for idx, ln in enumerate(lines):
+        s = ln.strip()
+        if not s:
+            continue
+        toks = s.split()
+        if len(toks) >= 3:
+            try:
+                float(toks[0].lstrip('+'))
+                data_start = idx
+                break
+            except Exception:
+                continue
+
+    if data_start is None:
+        raise RuntimeError("Could not find data block in .TAB")
+
+    for i in range(len(forward_errors)):
+        src_idx = data_start + i
+        if src_idx >= len(lines):
+            lines.append(f"{i * step_size:.4f} {forward_errors[i]:.4f} {reverse_errors[i]:.4f}")
+            continue
+
+        ln = lines[src_idx]
+        m = pattern.match(ln)
+        if m:
+            g = m.groups()
+            new_col2 = format_like(g[3], forward_errors[i])
+            new_col3 = format_like(g[5], reverse_errors[i])
+            lines[src_idx] = f"{g[0]}{g[1]}{g[2]}{new_col2}{g[4]}{new_col3}{g[6]}"
         else:
-            messagebox.showerror("No file loaded", "Please, load a file!")
-    except ValueError:
-        messagebox.showerror("Invalid input", "Please enter a valid number for Measured Position")
+            leading_ws = re.match(r'^(\s*)', ln).group(1)
+            lines[src_idx] = f"{leading_ws}{ln.strip().split()[0]} {forward_errors[i]:.4f} {reverse_errors[i]:.4f}"
+
+    with open(save_path, 'w') as f:
+        for ln in lines:
+            f.write(ln if ln.endswith('\n') else ln + '\n')
+
+    print(f"Saved new calibration file: {save_path}")
+
+
+def main():
+    print("=== CNC Ballscrew Auto Calibration ===")
+    tab_path = choose_tab_file()
+    if not tab_path:
+        print("No TAB file chosen.")
         return
 
-    # Parse current row
-    row = data[current_row].split()
-    index = float(row[0])
-    prev_measured = float(row[1])
-    prev_correction = float(row[2])
+    entries, n_points, step_size, unitscode, lines = parse_tab_header(tab_path)
 
-    # Calculate new correction
-    new_error = index - new_measured_float
-    
-    if cumulative_error_mode.get():  # If cumulative mode is enabled
-        new_correction = prev_correction + new_error
-    else:  # Otherwise, override the correction
-        new_correction = new_error
+    global ARDUINO_COM
+    if not ARDUINO_COM:
+        root = tk.Tk()
+        root.withdraw()
+        ARDUINO_COM = simpledialog.askstring("Arduino COM", "Enter COM port (e.g. COM5):")
+        if not ARDUINO_COM:
+            print("No COM specified.")
+            return
 
-    # Update the row data
-    data[current_row] = f"    {index:+.8f}    {new_measured_float:+.8f}    {new_correction:+.8f}\n"
+    ser = open_serial(ARDUINO_COM)
+    print(f"Connected to Arduino on {ARDUINO_COM}")
 
-    # Update the UI display
-    measured_val.set(f"{new_measured_float:+.8f}")
-    correction_val.set(f"{new_correction:+.8f}")
+    arduino_cmd(ser, "ZERO")
+    time.sleep(0.2)
+    ack = ser.readline().decode(errors='ignore').strip()
+    print("Arduino:", ack)
 
-    # Clear the input field
-    new_measured_entry.delete(0, tk.END)
+    messagebox.showinfo("Ready",
+                        f"Focus Acorn window and ensure machine is at HOME.\n"
+                        f"{n_points} steps, {step_size}mm each.\nStarting in 5s...")
 
-    # Move to the next row automatically
-    if current_row < len(data) - 1:
-        display_row(current_row + 1)
+    for s in range(5, 0, -1):
+        print("Starting in", s)
+        time.sleep(1)
 
-# Function to save the updated file
-def save_file():
-    global output_file
+    # FORWARD PASS
+    print("\n=== Forward Pass ===")
+    forward_readings = run_pass(ser, n_points, step_size, +1)
 
-    # Ask user where to save the updated file
-    output_file = filedialog.asksaveasfilename(
-        title="Save Updated TAB File",
+    messagebox.showinfo("Forward Complete", "Forward pass done.\nClick OK for reverse.")
+    print("\n=== Reverse Pass ===")
+    reverse_readings = run_pass(ser, n_points, step_size, -1)
+
+    # Compute per-step errors in microns
+    commanded_positions = [i * step_size for i in range(n_points)]
+    forward_errors = []
+    reverse_errors = []
+
+    for i in range(n_points):
+        cmd = commanded_positions[i]   # mm
+        f = forward_readings[i]        # mm (from Arduino)
+        r = reverse_readings[i]        # mm
+
+        # Centroid TB058 correct formula:
+        err_f = (cmd - f)
+        err_r = (cmd - r)
+
+        forward_errors.append(err_f)
+        reverse_errors.append(err_r)
+
+    # Normalize to zero at home (first forward point)
+    zero_offset = forward_errors[0]
+
+    forward_errors = [e - zero_offset for e in forward_errors]
+    reverse_errors = [e - zero_offset for e in reverse_errors]
+    print("\nStep\tCmd(mm)\tFwdErr(um)\tRevErr(um)")
+
+    # Save updated .TAB
+    root = tk.Tk()
+    root.withdraw()
+    save_path = filedialog.asksaveasfilename(
+        title="Save updated .TAB",
         defaultextension=".tab",
-        filetypes=(("TAB files", "*.tab"), ("All files", "*.*"))
+        filetypes=[("TAB files", "*.tab"), ("All files", "*.*")]
     )
-
-    if not output_file:
+    if not save_path:
+        print("Save cancelled.")
         return
 
-    # Read the original headers and append the modified data
-    with open(input_file, mode='r') as file:
-        headers = file.readlines()[:5]  # First 5 lines (headers)
+    write_tab_file(lines, forward_errors, reverse_errors, step_size, save_path)
 
-    with open(output_file, mode='w') as file:
-        file.writelines(headers)  # Write headers
-        file.writelines(data)     # Write updated data
+    messagebox.showinfo("Done", f"Calibration done.\nFile saved to:\n{save_path}")
 
-    messagebox.showinfo("File Saved", f"Updated file saved as {os.path.basename(output_file)}")
 
-# Create UI Components
-file_label = tk.Label(root, text="No file loaded", pady=10)
-file_label.pack()
-
-row_label = tk.Label(root, text="Row 0/0", pady=10)
-row_label.pack()
-
-index_val = tk.StringVar()
-measured_val = tk.StringVar()
-correction_val = tk.StringVar()
-
-# Index, Measured Position, Correction display
-tk.Label(root, text="Axis position (mm):").pack()
-tk.Label(root, textvariable=index_val, padx=10).pack()
-
-tk.Label(root, text="Measured Position (mm):").pack()
-tk.Label(root, textvariable=measured_val, padx=10).pack()
-
-tk.Label(root, text="Correction (mm):").pack()
-tk.Label(root, textvariable=correction_val, padx=10).pack()
-
-# Entry to update Measured Position
-new_measured_label = tk.Label(root, text="New Measured DRO Position (mm):")
-new_measured_label.pack()
-new_measured_entry = tk.Entry(root)
-new_measured_entry.pack()
-new_measured_entry.bind('<Return>', update_row)  # Bind Enter key to update the row
-
-# Checkbox for cumulative error mode
-cumulative_checkbox = tk.Checkbutton(root, text="Cumulative Error Mode", variable=cumulative_error_mode)
-cumulative_checkbox.pack(pady=10)
-
-# Update Button
-update_button = tk.Button(root, text="Update Row", command=update_row)
-update_button.pack(pady=10)
-
-# Navigation Buttons
-nav_frame = tk.Frame(root)
-nav_frame.pack(pady=10)
-
-prev_button = tk.Button(nav_frame, text="Previous", state=tk.DISABLED, command=lambda: display_row(current_row - 1))
-prev_button.grid(row=0, column=0, padx=10)
-
-next_button = tk.Button(nav_frame, text="Next", state=tk.DISABLED, command=lambda: display_row(current_row + 1))
-next_button.grid(row=0, column=1, padx=10)
-
-# Load file button
-load_button = tk.Button(root, text="Load File", command=load_file)
-load_button.pack(pady=10)
-
-# Save file button
-save_button = tk.Button(root, text="Save Updated File", state=tk.DISABLED, command=save_file)
-save_button.pack(pady=10)
-
-# Run the tkinter main loop
-root.mainloop()
+if __name__ == "__main__":
+    main()
